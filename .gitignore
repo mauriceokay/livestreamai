@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+checkpoints/
+assets/face.jpg
+stream_*/
+*.mp4
+*.wav
