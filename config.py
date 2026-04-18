@@ -76,11 +76,12 @@ class TTSConfig:
 
 @dataclass
 class LLMConfig:
-    # backend: "claude" | "ollama"
+    # backend: "claude" | "ollama" | "local"
+    # "local" = your fine-tuned model served by Ollama after finetune/export_to_ollama.py
     backend: str = "claude"
     anthropic_api_key: str = ""
     claude_model: str = "claude-haiku-4-5-20251001"
-    ollama_model: str = "llama3.2"
+    ollama_model: str = "llama3.2"     # set to "maya" after fine-tune export
     ollama_url: str = "http://localhost:11434"
     ollama_timeout_s: float = 15.0
     max_tokens: int = 120
@@ -179,6 +180,8 @@ class Config:
             self.llm.backend = v
         if v := os.getenv("ANTHROPIC_API_KEY"):
             self.llm.anthropic_api_key = v
+        if v := os.getenv("OLLAMA_MODEL"):
+            self.llm.ollama_model = v
 
         # ── TTS ──────────────────────────────────────────────────────────────
         if v := os.getenv("TTS_BACKEND"):
