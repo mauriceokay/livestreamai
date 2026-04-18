@@ -14,14 +14,25 @@ class PersonaConfig:
 
 @dataclass
 class StreamConfig:
-    rtmp_url: str = ""       # e.g. rtmps://live-push.tiktok.com/live/
+    # platform: "tiktok" | "youtube"
+    platform: str = "tiktok"
+    rtmp_url: str = ""        # TikTok: rtmps://live-push.tiktok.com/live/
+                              # YouTube: rtmp://a.rtmp.youtube.com/live2
     stream_key: str = ""
     width: int = 720
-    height: int = 1280       # portrait for TikTok
+    height: int = 1280        # portrait (9:16) for TikTok / YouTube Shorts
     fps: int = 25
     video_bitrate: str = "2500k"
     audio_bitrate: str = "128k"
     audio_sample_rate: int = 44100
+
+    # AI disclosure overlay (required by TikTok ToS)
+    show_disclosure: bool = True
+    disclosure_text: str = "AI Generated"
+
+    # Optional lower-third app promo banner
+    show_promo_banner: bool = True
+    promo_text: str = ""      # e.g. "Download MyApp — link in bio!"
 
 
 @dataclass
@@ -29,11 +40,10 @@ class TTSConfig:
     # backend: "elevenlabs" | "kokoro" | "coqui"
     backend: str = "elevenlabs"
     elevenlabs_api_key: str = ""
-    elevenlabs_voice_id: str = "21m00Tcm4TlvDq8ikWAM"  # Rachel — change to your clone
-    elevenlabs_model: str = "eleven_turbo_v2_5"         # lowest-latency model
-    kokoro_voice: str = "af_heart"                      # Kokoro voice name
+    elevenlabs_voice_id: str = "21m00Tcm4TlvDq8ikWAM"  # Rachel — replace with your clone
+    elevenlabs_model: str = "eleven_turbo_v2_5"          # lowest-latency ElevenLabs model
+    kokoro_voice: str = "af_heart"
     coqui_model: str = "tts_models/en/ljspeech/tacotron2-DDC"
-    chunk_silence_ms: int = 50   # padding silence appended to each chunk
 
 
 @dataclass
@@ -41,10 +51,10 @@ class LLMConfig:
     # backend: "claude" | "ollama"
     backend: str = "claude"
     anthropic_api_key: str = ""
-    claude_model: str = "claude-haiku-4-5-20251001"     # fastest Claude for real-time
+    claude_model: str = "claude-haiku-4-5-20251001"      # fastest Claude for real-time
     ollama_model: str = "llama3.2"
     ollama_url: str = "http://localhost:11434"
-    max_tokens: int = 120        # keep responses short for live feel
+    max_tokens: int = 120         # short responses = natural live-stream feel
     temperature: float = 0.85
 
 
@@ -52,13 +62,14 @@ class LLMConfig:
 class LipSyncConfig:
     # model: "latsync" | "wav2lip"
     model: str = "latsync"
-    base_face_image: str = "assets/face.jpg"            # reference portrait photo
-    latsync_checkpoint: str = "checkpoints/latsync.ckpt"
+    base_face_image: str = "assets/face.jpg"
+    latsync_checkpoint: str = "checkpoints/latentsync_unet.pt"
     wav2lip_checkpoint: str = "checkpoints/wav2lip_gan.pth"
-    device: str = "cuda"         # "cuda" or "cpu"
+    device: str = "cuda"          # "cuda" or "cpu"
     fps: int = 25
     face_det_batch_size: int = 4
     wav2lip_batch_size: int = 128
+    loops_dir: str = "assets/loops"
 
 
 @dataclass
@@ -70,18 +81,25 @@ class Config:
     lipsync: LipSyncConfig = field(default_factory=LipSyncConfig)
 
     tiktok_username: str = ""
-    chunk_duration_s: float = 1.5    # target seconds per TTS+lipsync chunk
-    idle_interval_s: float = 12.0    # seconds between unprompted remarks
-    max_queue_depth: int = 3         # drop old chunks if pipeline falls behind
+    idle_interval_s: float = 12.0     # seconds between unprompted remarks
+    max_queue_depth: int = 4          # drop oldest chunk if pipeline falls behind
 
     def load_from_env(self) -> "Config":
-        """Override config values from environment variables."""
+        if v := os.getenv("PLATFORM"):
+            self.stream.platform = v
         if v := os.getenv("TIKTOK_USERNAME"):
             self.tiktok_username = v
         if v := os.getenv("RTMP_URL"):
             self.stream.rtmp_url = v
         if v := os.getenv("STREAM_KEY"):
             self.stream.stream_key = v
+        if v := os.getenv("SHOW_DISCLOSURE"):
+            self.stream.show_disclosure = v.lower() not in ("0", "false", "no")
+        if v := os.getenv("DISCLOSURE_TEXT"):
+            self.stream.disclosure_text = v
+        if v := os.getenv("PROMO_TEXT"):
+            self.stream.promo_text = v
+            self.stream.show_promo_banner = bool(v)
         if v := os.getenv("ELEVENLABS_API_KEY"):
             self.tts.elevenlabs_api_key = v
         if v := os.getenv("ELEVENLABS_VOICE_ID"):
@@ -100,6 +118,9 @@ class Config:
             self.persona.name = v
         if v := os.getenv("APP_NAME"):
             self.persona.app_name = v
+            if not os.getenv("PROMO_TEXT"):
+                self.stream.promo_text = f"Download {v} — link in bio!"
+                self.stream.show_promo_banner = True
         if v := os.getenv("APP_DESCRIPTION"):
             self.persona.app_description = v
         return self
