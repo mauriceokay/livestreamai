@@ -1,14 +1,15 @@
 """
-TTS engines — converts text to a WAV audio file (one chunk at a time).
+TTS engines — converts text to WAV bytes (one chunk at a time).
 
 Backends:
-  elevenlabs  — cloud, best quality, ~200ms latency (default)
+  elevenlabs  — cloud, best quality, ~200 ms latency (default)
   kokoro      — local, good quality, runs on CPU
-  coqui       — local, older but battle-tested, CPU/GPU
+  coqui       — local, older but battle-tested
+
+All backends retry with exponential backoff and validate output audio.
 """
 import asyncio
 import io
-import struct
 import wave
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -16,13 +17,17 @@ from tempfile import NamedTemporaryFile
 
 import httpx
 
+from brain import _retry
 from config import TTSConfig
 
 
 class TTSBackend(ABC):
     @abstractmethod
     async def synthesize(self, text: str) -> bytes:
-        """Return raw WAV bytes for the given text."""
+        """Return validated WAV bytes for the given text."""
+
+    async def close(self) -> None:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -41,6 +46,14 @@ class ElevenLabsTTS(TTSBackend):
         )
 
     async def synthesize(self, text: str) -> bytes:
+        return await _retry(
+            lambda: self._synthesize_once(text),
+            max_retries=self._cfg.max_retries,
+            base_delay=self._cfg.retry_base_delay_s,
+            label="ElevenLabs",
+        )
+
+    async def _synthesize_once(self, text: str) -> bytes:
         url = f"/text-to-speech/{self._cfg.elevenlabs_voice_id}/stream"
         payload = {
             "text": text,
@@ -50,8 +63,9 @@ class ElevenLabsTTS(TTSBackend):
         }
         resp = await self._http.post(url, json=payload)
         resp.raise_for_status()
-        # ElevenLabs returns raw PCM — wrap it in a WAV container
-        return _pcm_to_wav(resp.content, sample_rate=44100, channels=1, sample_width=2)
+        wav = _pcm_to_wav(resp.content, sample_rate=44100, channels=1, sample_width=2)
+        _validate_wav(wav, label="ElevenLabs")
+        return wav
 
     async def close(self) -> None:
         await self._http.aclose()
@@ -69,30 +83,26 @@ class KokoroTTS(TTSBackend):
     def _load(self) -> None:
         if self._pipeline is not None:
             return
-        # Import lazily so the module loads even when kokoro isn't installed
         from kokoro import KPipeline  # type: ignore
-        self._pipeline = KPipeline(lang_code="a")  # "a" = American English
+        self._pipeline = KPipeline(lang_code="a")
 
     async def synthesize(self, text: str) -> bytes:
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._synthesize_sync, text)
+        wav = await loop.run_in_executor(None, self._synthesize_sync, text)
+        _validate_wav(wav, label="Kokoro")
+        return wav
 
     def _synthesize_sync(self, text: str) -> bytes:
         self._load()
         import numpy as np  # type: ignore
         import soundfile as sf  # type: ignore
-
         samples = []
         for _, _, audio in self._pipeline(text, voice=self._voice, speed=1.0):
             samples.append(audio)
         combined = np.concatenate(samples)
-
         buf = io.BytesIO()
         sf.write(buf, combined, 24000, format="WAV", subtype="PCM_16")
         return buf.getvalue()
-
-    async def close(self) -> None:
-        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -112,19 +122,19 @@ class CoquiTTS(TTSBackend):
 
     async def synthesize(self, text: str) -> bytes:
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._synthesize_sync, text)
+        wav = await loop.run_in_executor(None, self._synthesize_sync, text)
+        _validate_wav(wav, label="Coqui")
+        return wav
 
     def _synthesize_sync(self, text: str) -> bytes:
         self._load()
         with NamedTemporaryFile(suffix=".wav", delete=False) as f:
             path = f.name
-        self._tts.tts_to_file(text=text, file_path=path)
-        data = Path(path).read_bytes()
-        Path(path).unlink(missing_ok=True)
-        return data
-
-    async def close(self) -> None:
-        pass
+        try:
+            self._tts.tts_to_file(text=text, file_path=path)
+            return Path(path).read_bytes()
+        finally:
+            Path(path).unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -153,3 +163,15 @@ def _pcm_to_wav(pcm: bytes, sample_rate: int, channels: int, sample_width: int) 
         wf.setframerate(sample_rate)
         wf.writeframes(pcm)
     return buf.getvalue()
+
+
+def _validate_wav(wav_bytes: bytes, label: str = "TTS") -> None:
+    if not wav_bytes:
+        raise ValueError(f"{label} returned empty audio")
+    try:
+        with wave.open(io.BytesIO(wav_bytes)) as wf:
+            duration = wf.getnframes() / wf.getframerate()
+        if duration < 0.05:
+            raise ValueError(f"{label} audio too short ({duration:.3f} s) — likely empty response")
+    except wave.Error as exc:
+        raise ValueError(f"{label} returned invalid WAV: {exc}") from exc

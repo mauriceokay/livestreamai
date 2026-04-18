@@ -1,23 +1,26 @@
 """
 Main async pipeline — orchestrates all stages end-to-end.
 
-New flow (loop-library approach, ~650 ms end-to-end latency):
+Flow (~650 ms end-to-end latency):
 
-  TikTok/YouTube chat
+  TikTok / YouTube / Facebook / Instagram chat
         │
         ▼
-  Brain (LLM) — generates spoken text
+  ChatModerator — filters spam, profanity, rate-limits
         │
         ▼
-  TTS engine — converts text → WAV bytes  (~200 ms)
+  Brain (LLM) — generates spoken text  (Claude Haiku or Ollama)
         │
         ▼
-  LoopLibrary.make_chunk()                (~50 ms)
-    • picks a pre-rendered animated video loop
-    • ffmpeg overlays the live TTS audio onto it
+  TTS engine — text → WAV bytes         (~200 ms, ElevenLabs / Kokoro)
         │
         ▼
-  RTMPStreamer — pushes MP4 chunk to TikTok/YouTube via ffmpeg/RTMP
+  LoopLibrary.make_chunk()              (~50 ms, ffmpeg audio overlay)
+    • picks pre-rendered animated video loop matching speech mode
+    • overlays live TTS audio track
+        │
+        ▼
+  RTMPStreamer — ffmpeg tee → all platforms simultaneously
 
 Run:
   python pipeline.py
@@ -36,9 +39,10 @@ load_dotenv()
 from config import Config
 from brain import Brain, SpeechMode, SpeechRequest
 from tts import build_tts
-from loop_library import LoopLibrary, LoopCategory, MODE_TO_CATEGORY
+from loop_library import LoopLibrary, LoopCategory
 from streamer import RTMPStreamer
 from chat_reader import ChatReader, EventType, LiveEvent
+from moderator import ChatModerator
 from persona import idle_seed, react_prompt
 
 logging.basicConfig(
@@ -46,6 +50,13 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
 )
 log = logging.getLogger("pipeline")
+
+# Maps SpeechMode to the video loop category to play
+_MODE_CATEGORY: dict[SpeechMode, LoopCategory] = {
+    SpeechMode.IDLE:       LoopCategory.IDLE,
+    SpeechMode.CHAT_REPLY: LoopCategory.TALKING,
+    SpeechMode.REACT:      LoopCategory.REACT_HAPPY,
+}
 
 
 class Pipeline:
@@ -62,6 +73,7 @@ class Pipeline:
         self._tts = build_tts(cfg.tts)
         self._loops = LoopLibrary(cfg.lipsync.loops_dir)
         self._streamer = RTMPStreamer(cfg.stream)
+        self._moderator = ChatModerator(cfg.moderator)
         self._chat_reader = ChatReader(cfg.tiktok_username, self._chat_queue)
         self._viewer_count: int = 0
 
@@ -74,15 +86,18 @@ class Pipeline:
         await self._streamer.start()
 
         tasks = [
-            asyncio.create_task(self._chat_reader.start(),    name="chat-reader"),
-            asyncio.create_task(self._speech_stage(),          name="speech"),
-            asyncio.create_task(self._video_stage(),           name="video"),
-            asyncio.create_task(self._stream_stage(),          name="stream"),
-            asyncio.create_task(self._streamer.log_errors(),   name="ffmpeg-log"),
+            asyncio.create_task(self._chat_reader.start(),  name="chat-reader"),
+            asyncio.create_task(self._speech_stage(),        name="speech"),
+            asyncio.create_task(self._video_stage(),         name="video"),
+            asyncio.create_task(self._stream_stage(),        name="stream"),
+            asyncio.create_task(self._streamer.log_errors(), name="ffmpeg-log"),
         ]
 
-        log.info("Pipeline running on %s. Press Ctrl+C to stop.",
-                 self._cfg.stream.platform.upper())
+        platforms = ", ".join(
+            d.name.upper() for d in self._cfg.stream.destinations if d.enabled
+        )
+        log.info("Live on: %s — Press Ctrl+C to stop.", platforms)
+
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
@@ -97,12 +112,12 @@ class Pipeline:
         await self._chat_reader.stop()
         await self._streamer.stop()
         await self._brain.close()
-        log.info("Pipeline shut down.")
+        await self._tts.close()
+        stats = self._moderator.stats()
+        log.info("Pipeline shut down. Moderator blocked %d messages.", stats["blocked_total"])
 
     # ---------------------------------------------------------------------- #
     #  Stage 1 — Brain + TTS                                                  #
-    #  Input:  chat events (or idle timer)                                    #
-    #  Output: (SpeechMode, WAV bytes) → _speech_queue                       #
     # ---------------------------------------------------------------------- #
 
     async def _speech_stage(self) -> None:
@@ -126,26 +141,14 @@ class Pipeline:
                 t0 = time.monotonic()
                 text = await self._brain.speak(req)
                 log.info("[%s] %s", req.mode.value.upper(), text)
-
                 wav = await self._tts.synthesize(text)
-                log.debug("TTS done in %.0f ms", (time.monotonic() - t0) * 1000)
-
-                # Drop oldest if queue is backed up
-                if self._speech_queue.full():
-                    try:
-                        self._speech_queue.get_nowait()
-                        log.debug("Speech queue full — dropped oldest chunk")
-                    except asyncio.QueueEmpty:
-                        pass
-                await self._speech_queue.put((req.mode, wav))
-
+                log.debug("Speech+TTS: %.0f ms", (time.monotonic() - t0) * 1000)
+                _push_dropping(self._speech_queue, (req.mode, wav))
             except Exception as exc:
                 log.error("Speech stage: %s", exc)
 
     # ---------------------------------------------------------------------- #
     #  Stage 2 — Loop library: overlay audio on pre-rendered video            #
-    #  Input:  (SpeechMode, WAV bytes) from _speech_queue                    #
-    #  Output: MP4 bytes → _video_queue                                      #
     # ---------------------------------------------------------------------- #
 
     async def _video_stage(self) -> None:
@@ -155,36 +158,27 @@ class Pipeline:
                     self._speech_queue.get(), timeout=2.0
                 )
             except asyncio.TimeoutError:
-                # No speech queued — push a silent idle frame to keep stream alive
                 try:
                     idle_mp4 = await self._loops.idle_chunk(duration_s=1.5)
-                    await self._video_queue.put(idle_mp4)
+                    _push_dropping(self._video_queue, idle_mp4)
                 except Exception as exc:
-                    log.warning("Idle chunk failed: %s", exc)
+                    log.warning("Idle chunk: %s", exc)
                 continue
 
             try:
                 t0 = time.monotonic()
-                category = MODE_TO_CATEGORY.get(mode, LoopCategory.TALKING)
-
-                # React events get the higher-energy clips
+                category = _MODE_CATEGORY.get(mode, LoopCategory.TALKING)
+                # Gift reactions get the more excited loop category
+                if mode == SpeechMode.REACT:
+                    category = LoopCategory.REACT_GIFT
                 mp4 = await self._loops.make_chunk(category, wav)
-                log.debug("Video chunk ready in %.0f ms", (time.monotonic() - t0) * 1000)
-
-                if self._video_queue.full():
-                    try:
-                        self._video_queue.get_nowait()
-                        log.debug("Video queue full — dropped oldest chunk")
-                    except asyncio.QueueEmpty:
-                        pass
-                await self._video_queue.put(mp4)
-
+                log.debug("Video chunk: %.0f ms", (time.monotonic() - t0) * 1000)
+                _push_dropping(self._video_queue, mp4)
             except Exception as exc:
                 log.error("Video stage: %s", exc)
 
     # ---------------------------------------------------------------------- #
     #  Stage 3 — RTMP stream                                                  #
-    #  Input:  MP4 bytes from _video_queue                                   #
     # ---------------------------------------------------------------------- #
 
     async def _stream_stage(self) -> None:
@@ -193,12 +187,12 @@ class Pipeline:
                 mp4 = await asyncio.wait_for(self._video_queue.get(), timeout=5.0)
                 await self._streamer.send_chunk(mp4)
             except asyncio.TimeoutError:
-                log.warning("Stream stage: no video for 5 s — is the video stage running?")
+                log.warning("Stream stage: no video for 5 s")
             except Exception as exc:
                 log.error("Stream stage: %s", exc)
 
     # ---------------------------------------------------------------------- #
-    #  Event → SpeechRequest mapping                                          #
+    #  Event → SpeechRequest                                                  #
     # ---------------------------------------------------------------------- #
 
     def _event_to_request(self, event: LiveEvent) -> SpeechRequest | None:
@@ -208,14 +202,16 @@ class Pipeline:
                 return SpeechRequest(
                     mode=SpeechMode.REACT,
                     user_prompt=react_prompt(
-                        "milestone", self._cfg.persona,
-                        count=self._viewer_count,
+                        "milestone", self._cfg.persona, count=self._viewer_count
                     ),
                     priority=2,
                 )
             return None
 
         if event.type == EventType.CHAT:
+            if not self._moderator.allow(event.username, event.text):
+                log.debug("Moderated: [%s] %r", event.username, event.text[:60])
+                return None
             return SpeechRequest(
                 mode=SpeechMode.CHAT_REPLY,
                 user_prompt=(
@@ -230,7 +226,7 @@ class Pipeline:
             return SpeechRequest(
                 mode=SpeechMode.REACT,
                 user_prompt=react_prompt("follow", self._cfg.persona,
-                                         username=event.username),
+                                          username=event.username),
                 username=event.username,
                 priority=2,
             )
@@ -239,7 +235,7 @@ class Pipeline:
             return SpeechRequest(
                 mode=SpeechMode.REACT,
                 user_prompt=react_prompt("gift", self._cfg.persona,
-                                         username=event.username),
+                                          username=event.username),
                 username=event.username,
                 priority=3,
             )
@@ -248,7 +244,7 @@ class Pipeline:
             return SpeechRequest(
                 mode=SpeechMode.REACT,
                 user_prompt=react_prompt("share", self._cfg.persona,
-                                         username=event.username),
+                                          username=event.username),
                 username=event.username,
                 priority=1,
             )
@@ -263,8 +259,12 @@ class Pipeline:
         errors = []
         cfg = self._cfg
 
-        if not cfg.stream.rtmp_url or not cfg.stream.stream_key:
-            errors.append("RTMP_URL and STREAM_KEY must be set in .env")
+        if not cfg.stream.destinations:
+            errors.append(
+                "No stream destinations configured.\n"
+                "   Set at least one of: TIKTOK_STREAM_KEY, YOUTUBE_STREAM_KEY, "
+                "FACEBOOK_STREAM_KEY, INSTAGRAM_STREAM_KEY"
+            )
         if cfg.llm.backend == "claude" and not cfg.llm.anthropic_api_key:
             errors.append("ANTHROPIC_API_KEY required for claude LLM backend")
         if cfg.tts.backend == "elevenlabs" and not cfg.tts.elevenlabs_api_key:
@@ -272,21 +272,35 @@ class Pipeline:
         if not Path(cfg.lipsync.base_face_image).exists():
             errors.append(
                 f"Face image not found: {cfg.lipsync.base_face_image}\n"
-                "   Put a portrait photo there, then run: python generate_loops.py"
+                "   Add a portrait photo, then run: python generate_loops.py"
             )
         if not self._loops.ready():
             missing = self._loops.missing_categories()
             errors.append(
-                f"Video loop library not ready (missing: {', '.join(missing)})\n"
+                f"Video loop library incomplete (missing: {', '.join(missing)})\n"
                 "   Run:  python generate_loops.py"
             )
-        if cfg.stream.platform == "tiktok" and not cfg.tiktok_username:
-            log.warning("TIKTOK_USERNAME not set — chat reading disabled")
+        if not cfg.tiktok_username:
+            log.warning("TIKTOK_USERNAME not set — TikTok chat reading disabled")
 
         if errors:
             for e in errors:
-                log.error("Config error: %s", e)
+                log.error("  %s", e)
             sys.exit(1)
+
+
+# --------------------------------------------------------------------------- #
+#  Helpers                                                                      #
+# --------------------------------------------------------------------------- #
+
+def _push_dropping(queue: asyncio.Queue, item) -> None:
+    """Put item in queue, dropping the oldest entry if full."""
+    if queue.full():
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+    queue.put_nowait(item)
 
 
 # --------------------------------------------------------------------------- #
@@ -296,19 +310,15 @@ class Pipeline:
 async def main() -> None:
     cfg = Config().load_from_env()
     pipeline = Pipeline(cfg)
-
     loop = asyncio.get_event_loop()
     stop_event = asyncio.Event()
 
-    def _handle_signal() -> None:
-        log.info("Shutdown signal received …")
-        stop_event.set()
-
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _handle_signal)
+        loop.add_signal_handler(sig, stop_event.set)
 
     pipeline_task = asyncio.create_task(pipeline.run())
     await stop_event.wait()
+    log.info("Shutdown signal received …")
     pipeline_task.cancel()
     await asyncio.gather(pipeline_task, return_exceptions=True)
 

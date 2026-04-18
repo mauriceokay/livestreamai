@@ -1,6 +1,6 @@
 """
-Lip-sync engine — takes a WAV audio chunk + base face image and returns
-a raw H.264 video chunk (bytes) that can be piped straight to ffmpeg.
+Lip-sync engine — used by generate_loops.py (one-time pre-rendering).
+Not used during live streaming; the loop library handles that.
 
 Supported models:
   latsync  — LatentSync (ByteDance, state-of-the-art, needs CUDA GPU)
@@ -20,25 +20,10 @@ from config import LipSyncConfig
 class LipSync:
     def __init__(self, cfg: LipSyncConfig):
         self._cfg = cfg
-        self._face_img: np.ndarray | None = None
-        self._model = None
-
-    # ---------------------------------------------------------------------- #
-    #  Public API                                                              #
-    # ---------------------------------------------------------------------- #
 
     async def generate_chunk(self, wav_bytes: bytes) -> bytes:
-        """
-        Given WAV audio bytes, return an MP4 video chunk (bytes) of the face
-        speaking those words.  Runs the heavy work in a thread pool so the
-        async event loop is never blocked.
-        """
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._sync_generate, wav_bytes)
-
-    # ---------------------------------------------------------------------- #
-    #  Sync implementation (runs in thread pool)                              #
-    # ---------------------------------------------------------------------- #
 
     def _sync_generate(self, wav_bytes: bytes) -> bytes:
         with tempfile.TemporaryDirectory() as tmp:
@@ -52,46 +37,27 @@ class LipSync:
             else:
                 self._run_wav2lip(wav_path, out_path)
 
+            if not out_path.exists():
+                raise RuntimeError("Lip-sync produced no output file")
             return out_path.read_bytes()
 
-    # ---------------------------------------------------------------------- #
-    #  LatentSync                                                              #
-    # ---------------------------------------------------------------------- #
-
     def _run_latsync(self, wav_path: Path, out_path: Path) -> None:
-        """
-        Calls the LatentSync inference script.
-        Expects the repo cloned to ./LatentSync/ with its conda env active,
-        or installed as a package.
-        """
-        face = self._cfg.base_face_image
-        ckpt = self._cfg.latsync_checkpoint
         cmd = [
             "python", "-m", "latentsync.inference",
-            "--video_path", face,
+            "--video_path", self._cfg.base_face_image,
             "--audio_path", str(wav_path),
             "--output_path", str(out_path),
-            "--checkpoint_path", ckpt,
+            "--checkpoint_path", self._cfg.latsync_checkpoint,
             "--device", self._cfg.device,
             "--fps", str(self._cfg.fps),
         ]
-        _run(cmd)
-
-    # ---------------------------------------------------------------------- #
-    #  Wav2Lip                                                                 #
-    # ---------------------------------------------------------------------- #
+        _run(cmd, timeout=self._cfg.subprocess_timeout_s)
 
     def _run_wav2lip(self, wav_path: Path, out_path: Path) -> None:
-        """
-        Calls the Wav2Lip inference script.
-        Expects the repo cloned to ./Wav2Lip/ with dependencies installed.
-        """
-        face = self._cfg.base_face_image
-        ckpt = self._cfg.wav2lip_checkpoint
         cmd = [
             "python", "Wav2Lip/inference.py",
-            "--checkpoint_path", ckpt,
-            "--face", face,
+            "--checkpoint_path", self._cfg.wav2lip_checkpoint,
+            "--face", self._cfg.base_face_image,
             "--audio", str(wav_path),
             "--outfile", str(out_path),
             "--fps", str(self._cfg.fps),
@@ -99,18 +65,10 @@ class LipSync:
             "--wav2lip_batch_size", str(self._cfg.wav2lip_batch_size),
             "--nosmooth",
         ]
-        _run(cmd)
+        _run(cmd, timeout=self._cfg.subprocess_timeout_s)
 
-
-# ---------------------------------------------------------------------------- #
-#  Idle-frame generator                                                          #
-# ---------------------------------------------------------------------------- #
 
 def generate_idle_loop(face_image_path: str, fps: int, duration_s: float) -> bytes:
-    """
-    Creates a short silent MP4 of the face image (no movement) to fill gaps
-    when no audio is being generated.  Used as a placeholder between chunks.
-    """
     frame = cv2.imread(face_image_path)
     if frame is None:
         raise FileNotFoundError(f"Face image not found: {face_image_path}")
@@ -118,27 +76,33 @@ def generate_idle_loop(face_image_path: str, fps: int, duration_s: float) -> byt
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
         out_path = f.name
 
-    total_frames = int(fps * duration_s)
-    h, w = frame.shape[:2]
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
-    for _ in range(total_frames):
-        writer.write(frame)
-    writer.release()
+    try:
+        total_frames = int(fps * duration_s)
+        h, w = frame.shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
+        for _ in range(total_frames):
+            writer.write(frame)
+        writer.release()
+        return Path(out_path).read_bytes()
+    finally:
+        Path(out_path).unlink(missing_ok=True)
 
-    data = Path(out_path).read_bytes()
-    Path(out_path).unlink(missing_ok=True)
-    return data
 
-
-# ---------------------------------------------------------------------------- #
-#  Helper                                                                        #
-# ---------------------------------------------------------------------------- #
-
-def _run(cmd: list[str]) -> None:
-    result = subprocess.run(cmd, capture_output=True, text=True)
+def _run(cmd: list[str], timeout: int = 120) -> None:
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"Lip-sync timed out after {timeout} s: {' '.join(cmd)}"
+        )
     if result.returncode != 0:
         raise RuntimeError(
-            f"Lip-sync command failed:\n{' '.join(cmd)}\n"
-            f"STDOUT: {result.stdout}\nSTDERR: {result.stderr}"
+            f"Lip-sync failed:\nCMD: {' '.join(cmd)}\n"
+            f"STDOUT: {result.stdout[-500:]}\nSTDERR: {result.stderr[-500:]}"
         )
