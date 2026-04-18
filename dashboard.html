@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Streamer Dashboard</title>
+<style>
+:root {
+  --bg:       #0d0d0d;
+  --surface:  #181818;
+  --surface2: #222;
+  --border:   #2c2c2c;
+  --text:     #e4e4e4;
+  --dim:      #888;
+  --green:    #22c55e;
+  --amber:    #f59e0b;
+  --orange:   #f97316;
+  --red:      #ef4444;
+  --blue:     #3b82f6;
+  --radius:   10px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, sans-serif; font-size: 14px; }
+
+/* ── Header ── */
+header {
+  position: sticky; top: 0; z-index: 100;
+  background: #111; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 12px;
+  padding: 0 20px; height: 52px;
+}
+header h1 { font-size: 15px; font-weight: 600; color: #fff; flex: 1; }
+.stat-pill {
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 20px; padding: 3px 12px; font-size: 12px; color: var(--dim);
+}
+.stat-pill span { color: var(--text); font-weight: 600; }
+.btn { cursor: pointer; border: none; border-radius: 7px; padding: 7px 14px; font-size: 13px; font-weight: 500; transition: opacity .15s; }
+.btn:hover { opacity: .85; }
+.btn-primary   { background: var(--blue); color: #fff; }
+.btn-danger    { background: var(--red);  color: #fff; }
+.btn-ghost     { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+.btn-sm { padding: 5px 10px; font-size: 12px; }
+
+/* ── Grid ── */
+main { padding: 20px; }
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 14px;
+}
+.empty-state {
+  grid-column: 1/-1; text-align: center;
+  padding: 80px 20px; color: var(--dim);
+}
+.empty-state h2 { font-size: 18px; margin-bottom: 8px; color: var(--text); }
+
+/* ── Streamer card ── */
+.card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 14px;
+  display: flex; flex-direction: column; gap: 10px;
+  transition: border-color .2s;
+}
+.card:hover { border-color: #444; }
+.card-header { display: flex; align-items: flex-start; gap: 10px; }
+.avatar {
+  width: 38px; height: 38px; border-radius: 50%;
+  background: linear-gradient(135deg, #6366f1, #8b5cf6);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 16px; flex-shrink: 0; font-weight: 700; color: #fff;
+}
+.card-name { font-weight: 600; font-size: 15px; line-height: 1.2; }
+.card-app  { font-size: 12px; color: var(--dim); margin-top: 2px; }
+.status-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  margin-left: auto; flex-shrink: 0; margin-top: 5px;
+}
+.dot-running  { background: var(--green);  box-shadow: 0 0 6px var(--green); }
+.dot-starting { background: var(--amber);  animation: pulse 1s infinite; }
+.dot-stopping { background: var(--orange); }
+.dot-error    { background: var(--red); }
+.dot-stopped  { background: #444; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+/* Platform badges */
+.platforms { display: flex; gap: 5px; flex-wrap: wrap; }
+.badge {
+  font-size: 10px; font-weight: 700; padding: 2px 7px;
+  border-radius: 4px; letter-spacing: .3px; text-transform: uppercase;
+}
+.badge-tiktok    { background: #ff005022; color: #ff4d6d; border: 1px solid #ff005044; }
+.badge-youtube   { background: #ff000022; color: #ff6b6b; border: 1px solid #ff000044; }
+.badge-facebook  { background: #1877f222; color: #60a5fa; border: 1px solid #1877f244; }
+.badge-instagram { background: #e1306c22; color: #f472b6; border: 1px solid #e1306c44; }
+
+/* Uptime + status text */
+.card-meta { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--dim); }
+.status-text { text-transform: capitalize; }
+.status-text.running  { color: var(--green); }
+.status-text.starting { color: var(--amber); }
+.status-text.error    { color: var(--red); }
+
+/* Log tail */
+.log-tail {
+  background: #111; border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px; font-family: monospace; font-size: 11px;
+  color: #666; max-height: 60px; overflow: hidden;
+  line-height: 1.5; display: none;
+}
+.card.running .log-tail, .card.error .log-tail { display: block; }
+.log-line { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.log-line.error { color: var(--red); }
+
+/* Card actions */
+.card-actions { display: flex; gap: 7px; margin-top: 2px; }
+.card-actions .btn { flex: 1; text-align: center; }
+.btn-stop  { background: var(--red);   color: #fff; font-weight: 600; }
+.btn-start { background: var(--green); color: #000; font-weight: 600; }
+
+/* ── Modal ── */
+.overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.75);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 200; padding: 20px; overflow-y: auto;
+}
+.overlay.hidden { display: none; }
+.modal {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); width: 100%; max-width: 560px;
+  max-height: 90vh; overflow-y: auto;
+}
+.modal-header {
+  padding: 18px 20px 14px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center;
+}
+.modal-header h2 { font-size: 16px; flex: 1; }
+.modal-close { background: none; border: none; color: var(--dim); font-size: 20px; cursor: pointer; }
+.modal-body { padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+.modal-footer {
+  padding: 14px 20px; border-top: 1px solid var(--border);
+  display: flex; gap: 8px; justify-content: flex-end;
+}
+
+/* Form elements */
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field label { font-size: 12px; color: var(--dim); font-weight: 500; }
+.field input, .field select, .field textarea {
+  background: var(--surface2); border: 1px solid var(--border);
+  color: var(--text); border-radius: 6px; padding: 8px 10px; font-size: 13px;
+  outline: none; width: 100%;
+}
+.field input:focus, .field select:focus, .field textarea:focus { border-color: var(--blue); }
+.field textarea { resize: vertical; min-height: 60px; font-family: inherit; }
+.field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.section-title {
+  font-size: 11px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .8px; color: var(--dim); margin-top: 4px;
+}
+
+/* Platform section in modal */
+.platform-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px; background: var(--surface2);
+  border: 1px solid var(--border); border-radius: 7px;
+}
+.platform-label { width: 80px; font-size: 12px; font-weight: 600; }
+.platform-key { flex: 1; }
+.platform-key input { margin: 0; }
+.toggle {
+  position: relative; width: 36px; height: 20px; flex-shrink: 0;
+}
+.toggle input { opacity: 0; width: 0; height: 0; }
+.toggle-slider {
+  position: absolute; inset: 0; background: #333; border-radius: 20px;
+  cursor: pointer; transition: background .2s;
+}
+.toggle-slider::after {
+  content: ''; position: absolute; width: 14px; height: 14px;
+  background: #fff; border-radius: 50%; top: 3px; left: 3px;
+  transition: transform .2s;
+}
+.toggle input:checked + .toggle-slider { background: var(--blue); }
+.toggle input:checked + .toggle-slider::after { transform: translateX(16px); }
+
+/* Log modal */
+.log-full {
+  font-family: monospace; font-size: 12px; color: #aaa;
+  white-space: pre-wrap; word-break: break-all;
+  background: #111; padding: 14px; border-radius: 6px;
+  max-height: 400px; overflow-y: auto;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<!-- ── Header ───────────────────────────────────────────────────────────── -->
+<header>
+  <h1>🎬 AI Streamer Dashboard</h1>
+  <div class="stat-pill"><span id="stat-running">0</span> running / <span id="stat-total">0</span> total</div>
+  <button class="btn btn-ghost btn-sm" onclick="openSettings()">⚙ Settings</button>
+  <button class="btn btn-danger  btn-sm" onclick="stopAll()">⏹ Stop All</button>
+  <button class="btn btn-primary btn-sm" onclick="openAdd()">＋ Add Streamer</button>
+</header>
+
+<!-- ── Card grid ─────────────────────────────────────────────────────────── -->
+<main>
+  <div class="grid" id="grid">
+    <div class="empty-state" id="empty">
+      <h2>No streamers yet</h2>
+      <p>Click <strong>+ Add Streamer</strong> to create your first AI streamer.</p>
+    </div>
+  </div>
+</main>
+
+<!-- ── Add/Edit modal ────────────────────────────────────────────────────── -->
+<div class="overlay hidden" id="edit-overlay" onclick="overlayClick(event,'edit-overlay')">
+<div class="modal" onclick="event.stopPropagation()">
+  <div class="modal-header">
+    <h2 id="edit-title">Add Streamer</h2>
+    <button class="modal-close" onclick="closeEdit()">×</button>
+  </div>
+  <div class="modal-body">
+    <input type="hidden" id="edit-id">
+
+    <p class="section-title">Identity</p>
+    <div class="field-row">
+      <div class="field"><label>Dashboard label</label><input id="e-label" placeholder="e.g. Maya – TikTok"></div>
+      <div class="field"><label>Persona name</label><input id="e-persona" value="Maya"></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>App name</label><input id="e-app" value="MyApp"></div>
+      <div class="field"><label>TikTok username (for chat)</label><input id="e-tiktok-user" placeholder="@username"></div>
+    </div>
+    <div class="field"><label>App description (2–3 words)</label>
+      <input id="e-appdesc" value="a new chat app that connects people">
+    </div>
+
+    <p class="section-title">Voice</p>
+    <div class="field">
+      <label>ElevenLabs voice ID <small style="color:var(--dim)">(overrides global setting)</small></label>
+      <input id="e-voice" placeholder="21m00Tcm4TlvDq8ikWAM — leave empty to use global">
+    </div>
+
+    <p class="section-title">Platforms — stream keys</p>
+    <div id="platform-rows"></div>
+
+    <p class="section-title">Behaviour</p>
+    <div class="field">
+      <label>Idle speak interval (seconds)</label>
+      <input id="e-idle" type="number" value="12" min="5" max="120">
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn btn-ghost" onclick="closeEdit()">Cancel</button>
+    <button class="btn btn-primary" onclick="saveStreamer()">Save</button>
+  </div>
+</div>
+</div>
+
+<!-- ── Global settings modal ─────────────────────────────────────────────── -->
+<div class="overlay hidden" id="settings-overlay" onclick="overlayClick(event,'settings-overlay')">
+<div class="modal" onclick="event.stopPropagation()">
+  <div class="modal-header">
+    <h2>Global Settings</h2>
+    <button class="modal-close" onclick="closeSettings()">×</button>
+  </div>
+  <div class="modal-body">
+    <p class="section-title">API Keys</p>
+    <div class="field"><label>Anthropic API key (for Claude LLM)</label>
+      <input id="s-anthropic" type="password" placeholder="sk-ant-..."></div>
+    <div class="field"><label>ElevenLabs API key (for TTS)</label>
+      <input id="s-elevenlabs" type="password" placeholder="your ElevenLabs key"></div>
+
+    <p class="section-title">LLM Backend</p>
+    <div class="field">
+      <select id="s-llm">
+        <option value="claude">Claude (Haiku — fastest, cloud)</option>
+        <option value="ollama">Ollama (local, free)</option>
+      </select>
+    </div>
+
+    <p class="section-title">TTS Backend</p>
+    <div class="field">
+      <select id="s-tts">
+        <option value="elevenlabs">ElevenLabs (cloud, best quality)</option>
+        <option value="kokoro">Kokoro (local, good quality)</option>
+        <option value="coqui">Coqui TTS (local, CPU)</option>
+      </select>
+    </div>
+
+    <p class="section-title">Lip-sync (for generate_loops.py)</p>
+    <div class="field-row">
+      <div class="field"><label>Model</label>
+        <select id="s-lipsync">
+          <option value="latsync">LatentSync (GPU, best)</option>
+          <option value="wav2lip">Wav2Lip (CPU, good)</option>
+        </select>
+      </div>
+      <div class="field"><label>Device</label>
+        <select id="s-device">
+          <option value="cuda">CUDA (GPU)</option>
+          <option value="cpu">CPU</option>
+        </select>
+      </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn btn-ghost" onclick="closeSettings()">Cancel</button>
+    <button class="btn btn-primary" onclick="saveSettings()">Save</button>
+  </div>
+</div>
+</div>
+
+<!-- ── Log viewer modal ───────────────────────────────────────────────────── -->
+<div class="overlay hidden" id="log-overlay" onclick="overlayClick(event,'log-overlay')">
+<div class="modal" style="max-width:680px" onclick="event.stopPropagation()">
+  <div class="modal-header">
+    <h2 id="log-title">Logs</h2>
+    <button class="modal-close" onclick="closeLogs()">×</button>
+  </div>
+  <div class="modal-body">
+    <div class="log-full" id="log-content">Loading…</div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn btn-ghost btn-sm" onclick="refreshLogs()">↻ Refresh</button>
+    <button class="btn btn-ghost" onclick="closeLogs()">Close</button>
+  </div>
+</div>
+</div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────
+let streamers = [];
+let logStreamerId = null;
+
+const PLATFORMS = ['tiktok','youtube','facebook','instagram'];
+const PLAT_LABELS = {tiktok:'TikTok',youtube:'YouTube',facebook:'Facebook',instagram:'Instagram'};
+
+// ── Polling ───────────────────────────────────────────────────────────────
+async function fetchStatus() {
+  try {
+    const r = await fetch('/api/streamers');
+    const d = await r.json();
+    streamers = d.streamers;
+    document.getElementById('stat-running').textContent = d.running;
+    document.getElementById('stat-total').textContent   = d.total;
+    renderGrid();
+    if (logStreamerId) refreshLogs();
+  } catch(e) { /* ignore network blips */ }
+}
+
+setInterval(fetchStatus, 2000);
+fetchStatus();
+
+// ── Render grid ───────────────────────────────────────────────────────────
+function renderGrid() {
+  const grid  = document.getElementById('grid');
+  const empty = document.getElementById('empty');
+  empty.style.display = streamers.length ? 'none' : 'block';
+
+  // Update or create cards
+  const existing = new Set(
+    [...grid.querySelectorAll('.card')].map(c => c.dataset.id)
+  );
+  const current = new Set(streamers.map(s => s.id));
+
+  // Remove cards no longer in list
+  existing.forEach(id => {
+    if (!current.has(id)) grid.querySelector(`[data-id="${id}"]`)?.remove();
+  });
+
+  streamers.forEach(s => {
+    let card = grid.querySelector(`[data-id="${s.id}"]`);
+    if (!card) {
+      card = document.createElement('div');
+      card.dataset.id = s.id;
+      grid.appendChild(card);
+    }
+    card.className = `card ${s.status}`;
+    card.innerHTML = cardHTML(s);
+  });
+}
+
+function cardHTML(s) {
+  const initial = (s.persona_name||'?')[0].toUpperCase();
+  const badges  = s.platforms.map(p =>
+    `<span class="badge badge-${p}">${PLAT_LABELS[p]||p}</span>`
+  ).join('');
+
+  const uptime = s.uptime ? fmtUptime(s.uptime) : '';
+  const statusClass = s.status;
+  const logLines = (s.logs||[]).slice(-3).map(l =>
+    `<div class="log-line${l.includes('ERROR')||l.includes('error')?'error':''}">${esc(l)}</div>`
+  ).join('');
+
+  const actionBtn = (s.status === 'running' || s.status === 'starting')
+    ? `<button class="btn btn-stop btn-sm" onclick="stop('${s.id}')">⏹ Stop</button>`
+    : `<button class="btn btn-start btn-sm" onclick="start('${s.id}')">▶ Start</button>`;
+
+  return `
+    <div class="card-header">
+      <div class="avatar">${initial}</div>
+      <div>
+        <div class="card-name">${esc(s.label||s.persona_name)}</div>
+        <div class="card-app">${esc(s.app_name)}</div>
+      </div>
+      <div class="status-dot dot-${s.status}"></div>
+    </div>
+    <div class="platforms">${badges||'<span style="color:var(--dim);font-size:11px">No platforms</span>'}</div>
+    <div class="card-meta">
+      <span class="status-text ${statusClass}">${s.status}</span>
+      ${uptime?`<span>· ${uptime}</span>`:''}
+      ${s.pid?`<span>· pid ${s.pid}</span>`:''}
+    </div>
+    <div class="log-tail">${logLines}</div>
+    <div class="card-actions">
+      ${actionBtn}
+      <button class="btn btn-ghost btn-sm" onclick="openLogs('${s.id}','${esc(s.label||s.persona_name)}')">Logs</button>
+      <button class="btn btn-ghost btn-sm" onclick="openEdit('${s.id}')">Edit</button>
+      <button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="del('${s.id}')">✕</button>
+    </div>`;
+}
+
+function fmtUptime(s) {
+  if (s < 60)   return `${s}s`;
+  if (s < 3600) return `${Math.floor(s/60)}m ${s%60}s`;
+  return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
+}
+
+function esc(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Actions ───────────────────────────────────────────────────────────────
+async function start(id) {
+  await fetch(`/api/streamers/${id}/start`, {method:'POST'});
+  fetchStatus();
+}
+
+async function stop(id) {
+  await fetch(`/api/streamers/${id}/stop`, {method:'POST'});
+  fetchStatus();
+}
+
+async function del(id) {
+  const s = streamers.find(x => x.id === id);
+  if (!confirm(`Delete "${s?.label||s?.persona_name}"? This cannot be undone.`)) return;
+  await fetch(`/api/streamers/${id}`, {method:'DELETE'});
+  fetchStatus();
+}
+
+async function stopAll() {
+  if (!confirm('Stop ALL running streamers?')) return;
+  await fetch('/api/stop-all', {method:'POST'});
+  fetchStatus();
+}
+
+// ── Add / Edit modal ──────────────────────────────────────────────────────
+function openAdd() {
+  document.getElementById('edit-title').textContent = 'Add Streamer';
+  document.getElementById('edit-id').value = '';
+  document.getElementById('e-label').value  = '';
+  document.getElementById('e-persona').value = 'Maya';
+  document.getElementById('e-app').value     = 'MyApp';
+  document.getElementById('e-appdesc').value = 'a new chat app that connects people';
+  document.getElementById('e-tiktok-user').value = '';
+  document.getElementById('e-voice').value   = '';
+  document.getElementById('e-idle').value    = '12';
+  buildPlatformRows({});
+  document.getElementById('edit-overlay').classList.remove('hidden');
+}
+
+async function openEdit(id) {
+  document.getElementById('edit-title').textContent = 'Edit Streamer';
+  const r = await fetch(`/api/streamers/${id}/config`);
+  const c = await r.json();
+  document.getElementById('edit-id').value     = id;
+  document.getElementById('e-label').value     = c.label||'';
+  document.getElementById('e-persona').value   = c.persona_name||'';
+  document.getElementById('e-app').value       = c.app_name||'';
+  document.getElementById('e-appdesc').value   = c.app_description||'';
+  document.getElementById('e-tiktok-user').value = c.tiktok_username||'';
+  document.getElementById('e-voice').value     = c.elevenlabs_voice_id||'';
+  document.getElementById('e-idle').value      = c.idle_interval_s||12;
+  buildPlatformRows(c);
+  document.getElementById('edit-overlay').classList.remove('hidden');
+}
+
+function buildPlatformRows(cfg) {
+  const container = document.getElementById('platform-rows');
+  container.innerHTML = PLATFORMS.map(p => {
+    const pk   = (cfg[p]||{});
+    const key  = pk.stream_key||'';
+    const checked = key ? 'checked' : '';
+    return `
+      <div class="platform-row">
+        <span class="badge badge-${p} platform-label">${PLAT_LABELS[p]}</span>
+        <div class="platform-key">
+          <input id="pk-${p}" type="password" placeholder="Stream key" value="${esc(key)}"
+            style="font-family:monospace">
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="pt-${p}" ${checked} onchange="togglePlatformKey('${p}')">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>`;
+  }).join('');
+}
+
+function togglePlatformKey(p) {
+  const input = document.getElementById(`pk-${p}`);
+  input.disabled = !document.getElementById(`pt-${p}`).checked;
+}
+
+async function saveStreamer() {
+  const id = document.getElementById('edit-id').value;
+  const platforms = {};
+  PLATFORMS.forEach(p => {
+    platforms[p] = { stream_key: document.getElementById(`pk-${p}`).value.trim(), rtmp_url: '' };
+  });
+  const body = {
+    id: id||undefined,
+    label:              document.getElementById('e-label').value.trim(),
+    persona_name:       document.getElementById('e-persona').value.trim(),
+    app_name:           document.getElementById('e-app').value.trim(),
+    app_description:    document.getElementById('e-appdesc').value.trim(),
+    tiktok_username:    document.getElementById('e-tiktok-user').value.trim().replace(/^@/,''),
+    elevenlabs_voice_id:document.getElementById('e-voice').value.trim(),
+    idle_interval_s:    parseFloat(document.getElementById('e-idle').value)||12,
+    ...platforms,
+  };
+  const url    = id ? `/api/streamers/${id}` : '/api/streamers';
+  const method = id ? 'PUT' : 'POST';
+  await fetch(url, {method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  closeEdit();
+  fetchStatus();
+}
+
+function closeEdit() { document.getElementById('edit-overlay').classList.add('hidden'); }
+
+// ── Settings modal ────────────────────────────────────────────────────────
+async function openSettings() {
+  const r = await fetch('/api/config/global');
+  const c = await r.json();
+  document.getElementById('s-anthropic').value  = c.anthropic_api_key||'';
+  document.getElementById('s-elevenlabs').value = c.elevenlabs_api_key||'';
+  document.getElementById('s-llm').value        = c.llm_backend||'claude';
+  document.getElementById('s-tts').value        = c.tts_backend||'elevenlabs';
+  document.getElementById('s-lipsync').value    = c.lipsync_model||'latsync';
+  document.getElementById('s-device').value     = c.lipsync_device||'cuda';
+  document.getElementById('settings-overlay').classList.remove('hidden');
+}
+
+async function saveSettings() {
+  const body = {
+    anthropic_api_key:  document.getElementById('s-anthropic').value.trim(),
+    elevenlabs_api_key: document.getElementById('s-elevenlabs').value.trim(),
+    llm_backend:        document.getElementById('s-llm').value,
+    tts_backend:        document.getElementById('s-tts').value,
+    lipsync_model:      document.getElementById('s-lipsync').value,
+    lipsync_device:     document.getElementById('s-device').value,
+  };
+  await fetch('/api/config/global', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  closeSettings();
+}
+
+function closeSettings() { document.getElementById('settings-overlay').classList.add('hidden'); }
+
+// ── Log viewer ────────────────────────────────────────────────────────────
+async function openLogs(id, label) {
+  logStreamerId = id;
+  document.getElementById('log-title').textContent = `Logs — ${label}`;
+  document.getElementById('log-overlay').classList.remove('hidden');
+  await refreshLogs();
+}
+
+async function refreshLogs() {
+  if (!logStreamerId) return;
+  const r = await fetch(`/api/streamers/${logStreamerId}/logs`);
+  const d = await r.json();
+  const el = document.getElementById('log-content');
+  el.textContent = (d.logs||[]).join('\n') || '(no logs yet)';
+  el.scrollTop = el.scrollHeight;
+}
+
+function closeLogs() {
+  logStreamerId = null;
+  document.getElementById('log-overlay').classList.add('hidden');
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+function overlayClick(e, id) {
+  if (e.target.id === id) {
+    if (id === 'edit-overlay')     closeEdit();
+    if (id === 'settings-overlay') closeSettings();
+    if (id === 'log-overlay')      closeLogs();
+  }
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { closeEdit(); closeSettings(); closeLogs(); }
+});
+</script>
+</body>
+</html>
