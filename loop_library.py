@@ -1,7 +1,7 @@
 """
 Pre-rendered video loop library.
 
-Instead of running LatentSync in real-time (5–15 s per chunk), we:
+Instead of running a diffusion model in real-time (5–300 s per chunk), we:
   1. Pre-render a small library of short animated clips once (generate_loops.py)
   2. At stream time, pick the right clip and overlay the live TTS audio onto it
      using ffmpeg — pure demux/mux, takes ~50 ms
@@ -10,6 +10,10 @@ Loop categories and fallback chain
 ───────────────────────────────────
   react_gift   → react_happy → talking
   react_happy  → talking
+  look_away    → idle
+  drink_water  → idle
+  laugh        → react_happy → talking
+  thinking     → idle
   idle         → talking
   talking      → (required — no fallback)
 """
@@ -22,19 +26,34 @@ from pathlib import Path
 
 
 class LoopCategory(str, Enum):
-    IDLE = "idle"
-    TALKING = "talking"
+    IDLE        = "idle"
+    TALKING     = "talking"
     REACT_HAPPY = "react_happy"
-    REACT_GIFT = "react_gift"
+    REACT_GIFT  = "react_gift"
+    LOOK_AWAY   = "look_away"
+    DRINK_WATER = "drink_water"
+    LAUGH       = "laugh"
+    THINKING    = "thinking"
 
 
 # Fallback chain: if a category has no clips, try the next in list
 _FALLBACK: dict[str, list[str]] = {
     LoopCategory.REACT_GIFT.value:  [LoopCategory.REACT_HAPPY.value, LoopCategory.TALKING.value],
     LoopCategory.REACT_HAPPY.value: [LoopCategory.TALKING.value],
+    LoopCategory.LOOK_AWAY.value:   [LoopCategory.IDLE.value],
+    LoopCategory.DRINK_WATER.value: [LoopCategory.IDLE.value],
+    LoopCategory.LAUGH.value:       [LoopCategory.REACT_HAPPY.value, LoopCategory.TALKING.value],
+    LoopCategory.THINKING.value:    [LoopCategory.IDLE.value],
     LoopCategory.IDLE.value:        [LoopCategory.TALKING.value],
     LoopCategory.TALKING.value:     [],
 }
+
+# Behavior categories that get injected silently (no TTS overlay needed)
+BEHAVIOR_CATEGORIES = frozenset({
+    LoopCategory.LOOK_AWAY,
+    LoopCategory.DRINK_WATER,
+    LoopCategory.THINKING,
+})
 
 
 class LoopLibrary:
@@ -51,11 +70,13 @@ class LoopLibrary:
         return bool(self._clips.get(LoopCategory.TALKING.value))
 
     def missing_categories(self) -> list[str]:
-        return [
-            cat.value
-            for cat in LoopCategory
-            if not self._clips.get(cat.value)
-        ]
+        # Only core categories are required; behavior clips are optional
+        required = {LoopCategory.TALKING, LoopCategory.IDLE,
+                    LoopCategory.REACT_HAPPY, LoopCategory.REACT_GIFT}
+        return [cat.value for cat in required if not self._clips.get(cat.value)]
+
+    def has_behavior_clips(self) -> bool:
+        return any(self._clips.get(c.value) for c in BEHAVIOR_CATEGORIES)
 
     async def make_chunk(self, category: LoopCategory, audio_wav: bytes) -> bytes:
         """
@@ -129,6 +150,14 @@ class LoopLibrary:
                     f"ffmpeg idle clip failed:\n{stderr.decode()[-500:]}"
                 )
             return out_path.read_bytes()
+
+    async def behavior_chunk(self, category: LoopCategory) -> bytes:
+        """
+        Return a pre-rendered behavior clip (look_away, drink_water, thinking).
+        These are played as-is — they have embedded audio from the lipsync render.
+        """
+        clip = self._pick(category)
+        return clip.read_bytes()
 
     # ------------------------------------------------------------------ #
     #  Internals                                                            #

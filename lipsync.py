@@ -3,8 +3,14 @@ Lip-sync engine — used by generate_loops.py (one-time pre-rendering).
 Not used during live streaming; the loop library handles that.
 
 Supported models:
-  latsync  — LatentSync (ByteDance, state-of-the-art, needs CUDA GPU)
-  wav2lip  — Wav2Lip GAN (older, runs on CPU, lower quality)
+  latsync  — LatentSync (ByteDance, state-of-the-art, needs CUDA)
+  wav2lip  — Wav2Lip GAN (older, CPU-compatible, lower quality)
+  emo      — EMO diffusion model (most realistic, needs A100/4090)
+  hallo2   — Hallo2 diffusion model (excellent long-form stability)
+
+EMO/Hallo2 produce natural blinks, head sway, and micro-expressions
+that make the face look genuinely alive rather than mechanically animated.
+Generate loops once offline — the live stream just muxes pre-rendered clips.
 """
 import asyncio
 import subprocess
@@ -34,6 +40,10 @@ class LipSync:
 
             if self._cfg.model == "latsync":
                 self._run_latsync(wav_path, out_path)
+            elif self._cfg.model == "emo":
+                self._run_emo(wav_path, out_path)
+            elif self._cfg.model == "hallo2":
+                self._run_hallo2(wav_path, out_path)
             else:
                 self._run_wav2lip(wav_path, out_path)
 
@@ -67,6 +77,39 @@ class LipSync:
         ]
         _run(cmd, timeout=self._cfg.subprocess_timeout_s)
 
+    def _run_emo(self, wav_path: Path, out_path: Path) -> None:
+        """
+        EMO (HumanAIGC/EMO) — diffusion talking-head with natural expressions.
+        Repo: https://github.com/HumanAIGC/EMO
+        Setup: python setup.py --model emo
+        """
+        cmd = [
+            "python", "EMO/run_demo.py",
+            "--image_path",      self._cfg.base_face_image,
+            "--audio_path",      str(wav_path),
+            "--output_path",     str(out_path),
+            "--checkpoint_dir",  self._cfg.emo_checkpoint,
+            "--fps",             str(self._cfg.fps),
+            "--device",          self._cfg.device,
+        ]
+        _run(cmd, timeout=self._cfg.subprocess_timeout_s)
+
+    def _run_hallo2(self, wav_path: Path, out_path: Path) -> None:
+        """
+        Hallo2 (fudan-generative-vision/hallo2) — high-quality long-form talking head.
+        Repo: https://github.com/fudan-generative-vision/hallo2
+        Setup: python setup.py --model hallo2
+        """
+        cmd = [
+            "python", "hallo2/scripts/inference.py",
+            "--source_image",  self._cfg.base_face_image,
+            "--driving_audio", str(wav_path),
+            "--output",        str(out_path),
+            "--config",        "hallo2/configs/inference/long.yaml",
+            "--checkpoint",    self._cfg.hallo2_checkpoint,
+        ]
+        _run(cmd, timeout=self._cfg.subprocess_timeout_s)
+
 
 def generate_idle_loop(face_image_path: str, fps: int, duration_s: float) -> bytes:
     frame = cv2.imread(face_image_path)
@@ -89,7 +132,7 @@ def generate_idle_loop(face_image_path: str, fps: int, duration_s: float) -> byt
         Path(out_path).unlink(missing_ok=True)
 
 
-def _run(cmd: list[str], timeout: int = 120) -> None:
+def _run(cmd: list[str], timeout: int = 300) -> None:
     try:
         result = subprocess.run(
             cmd,

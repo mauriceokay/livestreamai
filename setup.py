@@ -4,15 +4,17 @@ One-shot setup script for the AI livestreamer pipeline.
 What it does:
   1. Checks prerequisites (Python 3.10+, git, ffmpeg, CUDA)
   2. Creates required directories (checkpoints/, assets/)
-  3. Clones and installs the chosen lip-sync model (LatentSync or Wav2Lip)
+  3. Clones and installs the chosen lip-sync model
   4. Downloads model checkpoints from Hugging Face / Google Drive
   5. Installs Python dependencies
   6. Copies .env.example → .env if it doesn't exist yet
 
 Usage:
-  python setup.py --model latsync          # GPU (recommended)
-  python setup.py --model wav2lip          # CPU fallback
-  python setup.py --model latsync --no-cuda  # force CPU for LatentSync
+  python setup.py --model hallo2           # most realistic (diffusion, GPU)
+  python setup.py --model emo              # EMO diffusion (GPU)
+  python setup.py --model latsync         # fast & good (GPU, recommended default)
+  python setup.py --model wav2lip         # CPU fallback
+  python setup.py --model latsync --no-cuda  # force CPU
 """
 import argparse
 import os
@@ -44,6 +46,23 @@ FACE_DET_URL = (
     "https://www.adrianbulat.com/downloads/python-fan/s3fd-619a316812.pth"
 )
 FACE_DET_DEST = "checkpoints/face_detection/s3fd.pth"
+
+# EMO (HumanAIGC/EMO) — diffusion-based talking head
+EMO_REPO = "https://github.com/HumanAIGC/EMO.git"
+EMO_HF_REPO = "HumanAIGC/EMO"
+EMO_FILES = [
+    ("unet.pth",           "checkpoints/emo/unet.pth"),
+    ("vae.pth",            "checkpoints/emo/vae.pth"),
+    ("image_encoder.pth",  "checkpoints/emo/image_encoder.pth"),
+]
+
+# Hallo2 (fudan-generative-vision/hallo2) — high-quality long-form talking head
+HALLO2_REPO = "https://github.com/fudan-generative-vision/hallo2.git"
+HALLO2_HF_REPO = "fudan-generative-vision/hallo2"
+HALLO2_FILES = [
+    ("hallo2/net.pth",      "checkpoints/hallo2/net.pth"),
+    ("motion_module.pth",   "checkpoints/hallo2/motion_module.pth"),
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -147,6 +166,24 @@ def clone_wav2lip() -> None:
     _ok("Cloned Wav2Lip")
 
 
+def clone_emo() -> None:
+    _step("Cloning EMO (HumanAIGC)")
+    if Path("EMO/.git").exists():
+        _ok("EMO already cloned — skipping")
+        return
+    run(["git", "clone", "--depth=1", EMO_REPO, "EMO"])
+    _ok("Cloned EMO")
+
+
+def clone_hallo2() -> None:
+    _step("Cloning Hallo2 (fudan-generative-vision)")
+    if Path("hallo2/.git").exists():
+        _ok("hallo2 already cloned — skipping")
+        return
+    run(["git", "clone", "--depth=1", HALLO2_REPO, "hallo2"])
+    _ok("Cloned hallo2")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Step 4 — download checkpoints
 # ─────────────────────────────────────────────────────────────────────────────
@@ -206,6 +243,20 @@ def download_wav2lip_checkpoints() -> None:
         _ok(f"Copied face detection weights → {wav2lip_det}")
 
 
+def download_emo_checkpoints() -> None:
+    _step("Downloading EMO checkpoints (Hugging Face)")
+    Path("checkpoints/emo").mkdir(parents=True, exist_ok=True)
+    for hf_file, dest in EMO_FILES:
+        _hf_download(EMO_HF_REPO, hf_file, dest)
+
+
+def download_hallo2_checkpoints() -> None:
+    _step("Downloading Hallo2 checkpoints (Hugging Face)")
+    Path("checkpoints/hallo2").mkdir(parents=True, exist_ok=True)
+    for hf_file, dest in HALLO2_FILES:
+        _hf_download(HALLO2_HF_REPO, hf_file, dest)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Step 5 — pip install
 # ─────────────────────────────────────────────────────────────────────────────
@@ -222,6 +273,16 @@ def install_deps(model: str) -> None:
         if wav2lip_req.exists():
             run([_python(), "-m", "pip", "install", "-q", "-r", str(wav2lip_req)])
         _ok("Wav2Lip dependencies installed")
+    elif model == "emo" and Path("EMO").exists():
+        emo_req = Path("EMO/requirements.txt")
+        if emo_req.exists():
+            run([_python(), "-m", "pip", "install", "-q", "-r", str(emo_req)])
+        _ok("EMO dependencies installed")
+    elif model == "hallo2" and Path("hallo2").exists():
+        hallo2_req = Path("hallo2/requirements.txt")
+        if hallo2_req.exists():
+            run([_python(), "-m", "pip", "install", "-q", "-r", str(hallo2_req)])
+        _ok("Hallo2 dependencies installed")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -254,11 +315,12 @@ def setup_env(model: str, device: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_checklist(model: str) -> None:
-    ckpt_path = (
-        "checkpoints/latentsync_unet.pt"
-        if model == "latsync"
-        else "checkpoints/wav2lip_gan.pth"
-    )
+    ckpt_path = {
+        "latsync": "checkpoints/latentsync_unet.pt",
+        "wav2lip": "checkpoints/wav2lip_gan.pth",
+        "emo":     "checkpoints/emo/unet.pth",
+        "hallo2":  "checkpoints/hallo2/net.pth",
+    }.get(model, "checkpoints/latentsync_unet.pt")
     face_ok = Path("assets/face.jpg").exists()
     ckpt_ok = Path(ckpt_path).exists()
     env_ok = Path(".env").exists()
@@ -294,9 +356,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        choices=["latsync", "wav2lip"],
+        choices=["latsync", "wav2lip", "emo", "hallo2"],
         default="latsync",
-        help="Lip-sync model to install (default: latsync)",
+        help="hallo2/emo = most realistic (diffusion, A100/4090 required); "
+             "latsync = fast & good; wav2lip = CPU fallback",
     )
     parser.add_argument(
         "--no-cuda",
@@ -323,10 +386,18 @@ def main() -> None:
         clone_latsync()
         if not args.skip_checkpoints:
             download_latsync_checkpoints()
-    else:
+    elif args.model == "wav2lip":
         clone_wav2lip()
         if not args.skip_checkpoints:
             download_wav2lip_checkpoints()
+    elif args.model == "emo":
+        clone_emo()
+        if not args.skip_checkpoints:
+            download_emo_checkpoints()
+    elif args.model == "hallo2":
+        clone_hallo2()
+        if not args.skip_checkpoints:
+            download_hallo2_checkpoints()
 
     install_deps(args.model)
     setup_env(args.model, device)

@@ -1,21 +1,27 @@
 """
 One-time loop generation script.
 
-Generates the animated video loop library from a single face image/video.
+Generates the animated video loop library from a single face image.
 Run this once after setup.py, before starting the stream.
 
 What it creates (in assets/loops/):
-  idle_0.mp4 … idle_2.mp4        — face at rest, subtle movement
-  talking_0.mp4 … talking_4.mp4  — natural mouth movement
-  react_happy_0.mp4 …            — upbeat/excited expression
-  react_gift_0.mp4 …             — grateful/delighted expression
+  idle_0.mp4 … idle_2.mp4          — face at rest, subtle movement
+  talking_0.mp4 … talking_4.mp4    — natural mouth movement
+  react_happy_0.mp4 …              — upbeat / excited expression
+  react_gift_0.mp4 …               — grateful / delighted expression
+  look_away_0.mp4 …                — glances off screen then back
+  drink_water_0.mp4 …              — takes a sip, natural pause
+  laugh_0.mp4 …                    — genuine laugh reaction
+  thinking_0.mp4 …                 — thoughtful pause, slight head tilt
 
 Each clip is 3–4 seconds and loops seamlessly in the stream.
 
 Usage:
-  python generate_loops.py
+  python generate_loops.py                    # default (latsync)
+  python generate_loops.py --model hallo2     # most realistic
+  python generate_loops.py --model emo        # diffusion, very natural
   python generate_loops.py --model wav2lip    # CPU fallback
-  python generate_loops.py --only talking     # regenerate one category
+  python generate_loops.py --only look_away   # regenerate one category
 """
 import argparse
 import asyncio
@@ -36,12 +42,11 @@ log = logging.getLogger("generate_loops")
 # ─────────────────────────────────────────────────────────────────────────────
 #  Script lines for each loop category
 #  These are fed to TTS → LipSync to create the pre-rendered clips.
-#  They're never heard by viewers — only the animation matters.
+#  The animation is what matters — exact phrasing is never heard on stream.
 # ─────────────────────────────────────────────────────────────────────────────
 
 LOOP_SCRIPTS: dict[str, list[str]] = {
     "idle": [
-        # Very short, low-energy — just enough for natural micro-movement
         "Mm-hmm.",
         "Yeah.",
         "Okay.",
@@ -62,6 +67,30 @@ LOOP_SCRIPTS: dict[str, list[str]] = {
         "Oh wow, thank you so much, that means the world to me!",
         "Oh my gosh, you didn't have to do that, thank you!",
         "That is so generous, genuinely, thank you!",
+    ],
+
+    # ── Behavior clips: make the stream feel human ─────────────────────────
+    "look_away": [
+        # Brief glance off-screen then back — looks like reacting to notifications
+        "Oh wait, one sec.",
+        "Hold on, let me just—",
+        "Sorry, okay I'm back.",
+    ],
+    "drink_water": [
+        # Short pause with minimal speech — animation carries it
+        "Mm.",
+        "Okay.",
+        "Mmm, yeah.",
+    ],
+    "laugh": [
+        "Oh my god, that's so funny, I literally cannot.",
+        "Stop, I'm actually dead right now, that got me.",
+        "No wait, that actually made me laugh, I wasn't ready.",
+    ],
+    "thinking": [
+        "Hmm, okay, let me actually think about that for a sec.",
+        "I mean... yeah, you know what, that's actually a really good point.",
+        "That's a good question, honestly I've been thinking about that too.",
     ],
 }
 
@@ -106,15 +135,13 @@ async def main(model: str, device: str, only: str | None) -> None:
             log.info("  [%d/%d] TTS: %r", idx + 1, len(scripts), line[:50])
             try:
                 wav = await tts.synthesize(line)
-                log.info("  [%d/%d] LipSync …", idx + 1, len(scripts))
+                log.info("  [%d/%d] LipSync (%s) …", idx + 1, len(scripts), model)
                 mp4 = await lipsync.generate_chunk(wav)
                 dest.write_bytes(mp4)
                 log.info("  [%d/%d] Saved → %s", idx + 1, len(scripts), dest)
             except Exception as exc:
                 log.error("  [%d/%d] FAILED: %s", idx + 1, len(scripts), exc)
 
-        # For idle: also create a pure-static fallback using Ken Burns in ffmpeg
-        # so it doesn't look completely frozen if lipsync clips fail
         if category == "idle":
             _make_ken_burns_fallback(face, out_dir)
 
@@ -125,8 +152,8 @@ async def main(model: str, device: str, only: str | None) -> None:
 
 def _make_ken_burns_fallback(face_path: str, out_dir: Path) -> None:
     """
-    Creates a subtle zoom-in/out idle clip from the static face image using
-    ffmpeg's zoompan filter.  No ML required — runs in under a second.
+    Subtle zoom-in/out idle clip from the static face image using ffmpeg's
+    zoompan filter.  No ML required — runs in under a second.
     """
     dest = out_dir / "idle_static.mp4"
     if dest.exists():
@@ -166,14 +193,23 @@ def _print_summary(out_dir: Path) -> None:
         cat = c.stem.rsplit("_", 1)[0]
         by_cat.setdefault(cat, []).append(c.name)
 
+    core_cats    = {"idle", "talking", "react_happy", "react_gift"}
+    behavior_cats = {"look_away", "drink_water", "laugh", "thinking"}
+
     print(f"\n{'═'*55}")
     print("  Loop library summary")
     print(f"{'═'*55}")
     for cat, names in sorted(by_cat.items()):
-        status = "[ok]" if names else "[MISSING]"
-        print(f"  {status}  {cat}: {len(names)} clip(s)")
+        tag = "[behavior]" if cat in behavior_cats else "[core]    "
+        status = "[ok]" if names else "[MISSING] "
+        print(f"  {status}  {tag}  {cat}: {len(names)} clip(s)")
     print()
-    print("  Next step:  python pipeline.py")
+    missing_core = core_cats - set(by_cat.keys())
+    if missing_core:
+        print(f"  WARNING: Missing core categories: {', '.join(sorted(missing_core))}")
+        print(f"  Run: python generate_loops.py")
+    else:
+        print("  Next step:  python pipeline.py")
     print()
 
 
@@ -187,8 +223,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--model",
-        choices=["latsync", "wav2lip"],
+        choices=["latsync", "wav2lip", "emo", "hallo2"],
         default=os.getenv("LIPSYNC_MODEL", "latsync"),
+        help="hallo2/emo = most realistic (diffusion, needs GPU); "
+             "latsync = fast & good; wav2lip = CPU fallback",
     )
     parser.add_argument(
         "--device",
@@ -198,7 +236,7 @@ if __name__ == "__main__":
         "--only",
         choices=list(LOOP_SCRIPTS.keys()),
         default=None,
-        help="Regenerate a single category only",
+        help="Regenerate a single category (e.g. --only look_away)",
     )
     args = parser.parse_args()
     asyncio.run(main(args.model, args.device, args.only))

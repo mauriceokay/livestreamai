@@ -96,17 +96,20 @@ class LLMConfig:
 
 @dataclass
 class LipSyncConfig:
-    # model: "latsync" | "wav2lip"
+    # model: "latsync" | "wav2lip" | "emo" | "hallo2"
+    # emo / hallo2 = diffusion-based, far more realistic, needs A100/4090
     model: str = "latsync"
     base_face_image: str = "assets/face.jpg"
     latsync_checkpoint: str = "checkpoints/latentsync_unet.pt"
     wav2lip_checkpoint: str = "checkpoints/wav2lip_gan.pth"
+    emo_checkpoint: str = "checkpoints/emo"
+    hallo2_checkpoint: str = "checkpoints/hallo2"
     device: str = "cuda"
     fps: int = 25
     face_det_batch_size: int = 4
     wav2lip_batch_size: int = 128
     loops_dir: str = "assets/loops"
-    subprocess_timeout_s: int = 120
+    subprocess_timeout_s: int = 300    # diffusion models take longer per clip
 
 
 @dataclass

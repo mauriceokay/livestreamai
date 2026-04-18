@@ -10,7 +10,7 @@ Flow (~650 ms end-to-end latency):
         │
         ▼
   Brain (LLM) — generates spoken text  (Claude Haiku or Ollama)
-        │
+        │  ← thinking delay simulates reading + processing
         ▼
   TTS engine — text → WAV bytes         (~200 ms, ElevenLabs / Kokoro)
         │
@@ -22,11 +22,17 @@ Flow (~650 ms end-to-end latency):
         ▼
   RTMPStreamer — ffmpeg tee → all platforms simultaneously
 
+Realism features:
+  • Thinking delays (0.5–2s) before chat replies
+  • Behavior injection: look_away / drink_water / thinking clips every ~60s
+  • Natural idle variation via persona seeds
+
 Run:
   python pipeline.py
 """
 import asyncio
 import logging
+import random
 import signal
 import sys
 import time
@@ -39,7 +45,7 @@ load_dotenv()
 from config import Config
 from brain import Brain, SpeechMode, SpeechRequest
 from tts import build_tts
-from loop_library import LoopLibrary, LoopCategory
+from loop_library import LoopLibrary, LoopCategory, BEHAVIOR_CATEGORIES
 from streamer import RTMPStreamer
 from chat_reader import ChatReader, EventType, LiveEvent
 from moderator import ChatModerator
@@ -57,6 +63,13 @@ _MODE_CATEGORY: dict[SpeechMode, LoopCategory] = {
     SpeechMode.CHAT_REPLY: LoopCategory.TALKING,
     SpeechMode.REACT:      LoopCategory.REACT_HAPPY,
 }
+
+# Behavior clips that get injected periodically — no TTS needed
+_INJECT_BEHAVIORS = [
+    LoopCategory.LOOK_AWAY,
+    LoopCategory.DRINK_WATER,
+    LoopCategory.THINKING,
+]
 
 
 class Pipeline:
@@ -91,6 +104,7 @@ class Pipeline:
             asyncio.create_task(self._video_stage(),         name="video"),
             asyncio.create_task(self._stream_stage(),        name="stream"),
             asyncio.create_task(self._streamer.log_errors(), name="ffmpeg-log"),
+            asyncio.create_task(self._behavior_task(),       name="behavior"),
         ]
 
         platforms = ", ".join(
@@ -137,6 +151,12 @@ class Pipeline:
             if req is None:
                 continue
 
+            # Simulate reading + thinking before replying to chat
+            if req.mode == SpeechMode.CHAT_REPLY:
+                msg_len = len(req.user_prompt)
+                think_s = 0.7 + min(msg_len / 120, 1.6) + random.uniform(-0.2, 0.4)
+                await asyncio.sleep(max(0.4, think_s))
+
             try:
                 t0 = time.monotonic()
                 text = await self._brain.speak(req)
@@ -168,7 +188,6 @@ class Pipeline:
             try:
                 t0 = time.monotonic()
                 category = _MODE_CATEGORY.get(mode, LoopCategory.TALKING)
-                # Gift reactions get the more excited loop category
                 if mode == SpeechMode.REACT:
                     category = LoopCategory.REACT_GIFT
                 mp4 = await self._loops.make_chunk(category, wav)
@@ -190,6 +209,43 @@ class Pipeline:
                 log.warning("Stream stage: no video for 5 s")
             except Exception as exc:
                 log.error("Stream stage: %s", exc)
+
+    # ---------------------------------------------------------------------- #
+    #  Behavior injection — makes the stream feel human                        #
+    # ---------------------------------------------------------------------- #
+
+    async def _behavior_task(self) -> None:
+        """
+        Every 45-90 seconds, inject a pre-rendered behavior clip (look away,
+        take a drink, look thoughtful) directly into the video queue.
+        Only fires when the speech queue is idle so it doesn't interrupt replies.
+        """
+        if not self._loops.has_behavior_clips():
+            log.info(
+                "No behavior clips found — skipping behavior injection. "
+                "Run: python generate_loops.py --only look_away  (etc.)"
+            )
+            return
+
+        await asyncio.sleep(random.uniform(20, 40))  # initial delay before first behavior
+
+        while True:
+            await asyncio.sleep(random.uniform(45, 90))
+
+            # Don't interrupt active speech
+            if not self._speech_queue.empty():
+                continue
+
+            category = random.choice(_INJECT_BEHAVIORS)
+            if not self._loops._clips.get(category.value):
+                continue
+
+            try:
+                chunk = await self._loops.behavior_chunk(category)
+                _push_dropping(self._video_queue, chunk)
+                log.debug("Behavior: %s", category.value)
+            except Exception as exc:
+                log.debug("Behavior clip failed (non-critical): %s", exc)
 
     # ---------------------------------------------------------------------- #
     #  Event → SpeechRequest                                                  #
