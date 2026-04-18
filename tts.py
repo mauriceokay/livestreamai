@@ -5,6 +5,7 @@ Backends:
   elevenlabs  — cloud, best quality, ~200 ms latency (default)
   kokoro      — local, good quality, runs on CPU
   coqui       — local, older but battle-tested
+  xtts_local  — local XTTS2 voice clone (fine-tuned or zero-shot)
 
 All backends retry with exponential backoff and validate output audio.
 """
@@ -138,6 +139,81 @@ class CoquiTTS(TTSBackend):
 
 
 # --------------------------------------------------------------------------- #
+#  XTTS2 local voice clone                                                      #
+# --------------------------------------------------------------------------- #
+
+class XTTSLocalTTS(TTSBackend):
+    """
+    XTTS2 inference backend.
+
+    If xtts_checkpoint_dir is set, loads the fine-tuned model from that
+    directory (output of finetune/train_voice.py).  Otherwise falls back
+    to the base XTTS2 model for zero-shot voice cloning using only the
+    reference WAV.
+
+    xtts_reference_wav must always point to a clean speaker sample.
+    """
+
+    _ZERO_SHOT_MODEL = "tts_models/multilingual/multi-dataset/xtts_v2"
+
+    def __init__(self, cfg: TTSConfig):
+        self._cfg = cfg
+        self._tts = None
+        if not cfg.xtts_reference_wav:
+            raise ValueError(
+                "xtts_local backend requires XTTS_REFERENCE_WAV to be set."
+            )
+
+    def _load(self) -> None:
+        if self._tts is not None:
+            return
+
+        try:
+            from TTS.api import TTS  # type: ignore
+        except ImportError:
+            raise RuntimeError(
+                "Install Coqui TTS:\n"
+                "  pip install coqui-tts"
+            )
+
+        import torch
+
+        device = "cuda" if (self._cfg.xtts_use_gpu and torch.cuda.is_available()) else "cpu"
+
+        if self._cfg.xtts_checkpoint_dir:
+            model_path  = Path(self._cfg.xtts_checkpoint_dir)
+            config_path = model_path / "config.json"
+            self._tts = TTS(
+                model_path=str(model_path),
+                config_path=str(config_path),
+                progress_bar=False,
+            ).to(device)
+        else:
+            self._tts = TTS(self._ZERO_SHOT_MODEL, progress_bar=False).to(device)
+
+    async def synthesize(self, text: str) -> bytes:
+        loop = asyncio.get_event_loop()
+        wav = await loop.run_in_executor(None, self._synthesize_sync, text)
+        _validate_wav(wav, label="XTTS2")
+        return wav
+
+    def _synthesize_sync(self, text: str) -> bytes:
+        self._load()
+        with NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            out_path = f.name
+        try:
+            self._tts.tts_to_file(
+                text=text,
+                speaker_wav=self._cfg.xtts_reference_wav,
+                language="en",
+                file_path=out_path,
+            )
+            return Path(out_path).read_bytes()
+        finally:
+            Path(out_path).unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------------------- #
 #  Factory                                                                      #
 # --------------------------------------------------------------------------- #
 
@@ -148,6 +224,8 @@ def build_tts(cfg: TTSConfig) -> TTSBackend:
         return KokoroTTS(cfg)
     if cfg.backend == "coqui":
         return CoquiTTS(cfg)
+    if cfg.backend == "xtts_local":
+        return XTTSLocalTTS(cfg)
     raise ValueError(f"Unknown TTS backend: {cfg.backend!r}")
 
 

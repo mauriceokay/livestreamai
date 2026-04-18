@@ -63,13 +63,17 @@ class StreamConfig:
 
 @dataclass
 class TTSConfig:
-    # backend: "elevenlabs" | "kokoro" | "coqui"
+    # backend: "elevenlabs" | "kokoro" | "coqui" | "xtts_local"
     backend: str = "elevenlabs"
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = "21m00Tcm4TlvDq8ikWAM"
     elevenlabs_model: str = "eleven_turbo_v2_5"
     kokoro_voice: str = "af_heart"
     coqui_model: str = "tts_models/en/ljspeech/tacotron2-DDC"
+    # XTTS2 local voice clone
+    xtts_checkpoint_dir: str = ""        # path to fine-tuned model dir; empty = zero-shot
+    xtts_reference_wav: str = ""         # speaker conditioning WAV
+    xtts_use_gpu: bool = True
     max_retries: int = 3
     retry_base_delay_s: float = 1.0
 
@@ -190,6 +194,12 @@ class Config:
             self.tts.elevenlabs_api_key = v
         if v := os.getenv("ELEVENLABS_VOICE_ID"):
             self.tts.elevenlabs_voice_id = v
+        if v := os.getenv("XTTS_CHECKPOINT_DIR"):
+            self.tts.xtts_checkpoint_dir = v
+        if v := os.getenv("XTTS_REFERENCE_WAV"):
+            self.tts.xtts_reference_wav = v
+        if v := os.getenv("XTTS_USE_GPU"):
+            self.tts.xtts_use_gpu = v.lower() not in ("0", "false", "no")
 
         # ── Lip-sync ─────────────────────────────────────────────────────────
         if v := os.getenv("LIPSYNC_MODEL"):
